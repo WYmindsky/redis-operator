@@ -204,7 +204,7 @@ func patchStatefulSet(storedStateful *appsv1.StatefulSet, newStateful *appsv1.St
 		}
 		return updateStatefulSet(namespace, newStateful, recreateStateFulSet)
 	}
-	logger.V(1).Info("Reconciliation Complete, no Changes required.")
+	logger.Info("Reconciliation Complete, no Changes required.")
 	return nil
 }
 
@@ -644,7 +644,7 @@ func createStatefulSet(namespace string, stateful *appsv1.StatefulSet) error {
 		logger.Error(err, "Redis stateful creation failed")
 		return err
 	}
-	logger.V(1).Info("Redis stateful successfully created")
+	logger.Info("Redis stateful successfully created")
 	return nil
 }
 
@@ -659,7 +659,7 @@ func updateStatefulSet(namespace string, stateful *appsv1.StatefulSet, recreateS
 			for messageCount, cause := range sErr.ErrStatus.Details.Causes {
 				failMsg[messageCount] = cause.Message
 			}
-			logger.V(1).Info("recreating StatefulSet because the update operation wasn't possible", "reason", strings.Join(failMsg, ", "))
+			logger.Info("recreating StatefulSet because the update operation wasn't possible", "reason", strings.Join(failMsg, ", "))
 			propagationPolicy := metav1.DeletePropagationForeground
 			if err := generateK8sClient().AppsV1().StatefulSets(namespace).Delete(context.TODO(), stateful.GetName(), metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil {
 				return errors.Wrap(err, "failed to delete StatefulSet to avoid forbidden action")
@@ -670,7 +670,7 @@ func updateStatefulSet(namespace string, stateful *appsv1.StatefulSet, recreateS
 		logger.Error(err, "Redis statefulset update failed")
 		return err
 	}
-	logger.V(1).Info("Redis statefulset successfully updated ")
+	logger.Info("Redis statefulset successfully updated ")
 	return nil
 }
 
@@ -685,7 +685,7 @@ func GetStatefulSet(namespace string, stateful string) (*appsv1.StatefulSet, err
 		logger.Info("Redis statefulset get action failed")
 		return nil, err
 	}
-	logger.V(1).Info("Redis statefulset get action was successful")
+	logger.Info("Redis statefulset get action was successful")
 	return statefulInfo, nil
 }
 

@@ -8,13 +8,23 @@ import (
 	"github.com/go-redis/redis"
 )
 
+//	{
+//		"172.16.20.1": "redis-cluster-leader-0",
+//		"172.16.20.2": "redis-cluster-leader-1",
+//		"172.16.20.1": "redis-cluster-leader-2",
+//		...
+//	}
+var StsPodIPNameMap = map[string]string{}
+
 // Reshard the redis Cluster
-func ReshardRedisCluster(cr *redisv1beta2.RedisCluster) {
+func ReshardRedisCluster(cr *redisv1beta2.RedisCluster) bool {
 	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
 	var cmd []string
 	currentRedisCount := CheckRedisNodeCount(cr, "leader")
+	// currentRedisCount := *cr.Spec.Size
 
 	// Transfer Pod details
+
 	transferPOD := RedisDetails{
 		PodName:   cr.ObjectMeta.Name + "-leader-0",
 		Namespace: cr.Namespace,
@@ -26,6 +36,7 @@ func ReshardRedisCluster(cr *redisv1beta2.RedisCluster) {
 	}
 	cmd = []string{"redis-cli", "--cluster", "reshard"}
 
+	logger.Info("version", "version", *cr.Spec.ClusterVersion, "is v7?", *cr.Spec.ClusterVersion == "v7")
 	if *cr.Spec.ClusterVersion == "v7" {
 		cmd = append(cmd, getRedisHostname(transferPOD, cr, "leader")+":6379")
 	} else {
@@ -62,13 +73,13 @@ func ReshardRedisCluster(cr *redisv1beta2.RedisCluster) {
 
 	cmd = append(cmd, "--cluster-yes")
 
-	logger.V(1).Info("Redis cluster reshard command is", "Command", cmd)
+	logger.Info("Redis cluster reshard command is", "Command", cmd)
 
 	if slot == "0" {
-		logger.V(1).Info("Skipped the execution of", "Cmd", cmd)
-		return
+		logger.Info("Skipped the execution of", "Cmd", cmd)
+		return true
 	}
-	executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-0")
+	return executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-0")
 }
 
 func getRedisClusterSlots(cr *redisv1beta2.RedisCluster, nodeID string) string {
@@ -88,7 +99,7 @@ func getRedisClusterSlots(cr *redisv1beta2.RedisCluster, nodeID string) string {
 
 	// Iterate through all lines
 	for _, line := range lines {
-		if strings.Contains(line, "master") && strings.Contains(line, "connected") { // Check if this line is a master node
+		if strings.Contains(line, "master") && strings.Contains(line, "connected") && !strings.Contains(line, ",fail") { // Check if this line is a master node
 			parts := strings.Fields(line)
 			if parts[0] == nodeID { // Check if this is the node we're interested in
 				for _, conn := range parts[8:] {
@@ -105,9 +116,7 @@ func getRedisClusterSlots(cr *redisv1beta2.RedisCluster, nodeID string) string {
 			}
 		}
 	}
-
-	logger.V(1).Info("Total cluster slots to be transfered from", "node", nodeID, "is", totalSlots)
-
+	// logger.Info("slot", "nodeID", nodeID, "slot", totalSlots)
 	return strconv.Itoa(totalSlots)
 }
 
@@ -136,7 +145,6 @@ func getRedisNodeID(cr *redisv1beta2.RedisCluster, pod RedisDetails) string {
 		logger.Error(err, "Redis command failed with this error")
 		return ""
 	}
-	logger.V(1).Info("Redis node ID ", "is", output)
 	return output
 }
 
@@ -145,8 +153,12 @@ func RebalanceRedisClusterEmptyMasters(cr *redisv1beta2.RedisCluster) {
 	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
 	// cmd = redis-cli --cluster rebalance <redis>:<port> --cluster-use-empty-masters -a <pass>
 	var cmd []string
+
+	// get ready pod
+	_, readyIP := GetAllFailedPods(cr)
+	readyPodName := StsPodIPNameMap[readyIP]
 	pod := RedisDetails{
-		PodName:   cr.ObjectMeta.Name + "-leader-1",
+		PodName:   readyPodName,
 		Namespace: cr.Namespace,
 	}
 	cmd = []string{"redis-cli", "--cluster", "rebalance"}
@@ -168,34 +180,107 @@ func RebalanceRedisClusterEmptyMasters(cr *redisv1beta2.RedisCluster) {
 		cmd = append(cmd, pass)
 	}
 
-	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.ObjectMeta.Name+"-leader-0")...)
+	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, readyPodName)...)
 
-	logger.V(1).Info("Redis cluster rebalance command is", "Command", cmd)
-	executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-1")
+	logger.Info("Redis cluster rebalance command is", "Command", cmd)
+	// if execute fail, maybe all nodes cluster config inconsistent
+	// needs to forget new added master and execute "cluster meet ip port" to rejoin cluster
+	if !executeCommand(cr, cmd, readyPodName) {
+		RejoinToCluster(cr, readyPodName)
+	}
+}
+
+func RejoinToCluster(cr *redisv1beta2.RedisCluster, readyPodName string) {
+	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
+	// forget new master
+	logger.Info("[ERR] Nodes don't agree about configuration! forget it and meet it")
+	podNameList, podIP := getLeader(cr)
+
+	for _, podName := range podNameList {
+		cmd := []string{"redis-cli"}
+		pod := RedisDetails{
+			PodName:   podName,
+			Namespace: cr.Namespace,
+		}
+
+		if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
+			pass, err := getRedisPassword(cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
+			if err != nil {
+				logger.Error(err, "Error in getting redis password")
+			}
+			cmd = append(cmd, "-a")
+			cmd = append(cmd, pass)
+		}
+
+		cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, readyPodName)...)
+		cmd = append(cmd, "cluster")
+		podNodeID := getRedisNodeID(cr, pod)
+		podSlots := getRedisClusterSlots(cr, podNodeID)
+
+		if podSlots == "0" || podSlots == "" {
+			logger.Info("Found Inconsistent Leader Node", "NodeID", podNodeID, "ip", podIP)
+			cmd = append(cmd, "reset")
+			if executeCommand(cr, cmd, StsPodIPNameMap[podIP]) {
+				logger.Info("cluster reset ok")
+				cmd = cmd[:len(cmd)-1]
+				cmd = append(cmd, "forget", podNodeID)
+				if executeCommand(cr, cmd, readyPodName) {
+					cmd = cmd[:len(cmd)-2]
+					cmd = append(cmd, "meet", podIP, "6379")
+					executeCommand(cr, cmd, readyPodName)
+				}
+			} else {
+				logger.Info("cluster reset failed")
+				continue
+			}
+		}
+	}
 }
 
 func CheckIfEmptyMasters(cr *redisv1beta2.RedisCluster) {
 	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
-	totalRedisLeaderNodes := CheckRedisNodeCount(cr, "leader")
 
-	for i := 0; i < int(totalRedisLeaderNodes); i++ {
+	podNameList, _ := getLeader(cr)
+	// logger.Info("leaders", "pod leaders", podNameList)
+	for _, podName := range podNameList {
 		pod := RedisDetails{
-			PodName:   cr.ObjectMeta.Name + "-leader-" + strconv.Itoa(i),
+			PodName:   podName,
 			Namespace: cr.Namespace,
 		}
 		podNodeID := getRedisNodeID(cr, pod)
 		podSlots := getRedisClusterSlots(cr, podNodeID)
 
 		if podSlots == "0" || podSlots == "" {
-			logger.V(1).Info("Found Empty Redis Leader Node", "pod", pod)
+			logger.Info("Found Empty Redis Leader Node", "pod", pod)
 			RebalanceRedisClusterEmptyMasters(cr)
 			break
 		}
 	}
 }
 
+// getLeader get all masters with slot field
+func getLeader(cr *redisv1beta2.RedisCluster) ([]string, string) {
+	clusterNodes := checkRedisCluster(cr)
+
+	podNameList := []string{}
+	podIP := ""
+	for _, node := range clusterNodes {
+		if node[2] == "master" || node[2] == "myself,master" {
+			podIP := strings.Split(node[1], ":")[0]
+			podName := StsPodIPNameMap[podIP]
+			if podName != "" {
+				podNameList = append(podNameList, podName)
+			}
+			if len(node) == 8 {
+				podIP = strings.Split(node[1], ":")[0]
+			}
+		}
+	}
+	return podNameList, podIP
+}
+
 // Rebalance Redis Cluster Would Rebalance the Redis Cluster without using the empty masters
-func RebalanceRedisCluster(cr *redisv1beta2.RedisCluster) {
+func RebalanceRedisCluster(cr *redisv1beta2.RedisCluster) bool {
 	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
 	// cmd = redis-cli --cluster rebalance <redis>:<port> -a <pass>
 	var cmd []string
@@ -222,8 +307,8 @@ func RebalanceRedisCluster(cr *redisv1beta2.RedisCluster) {
 
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.ObjectMeta.Name+"-leader-0")...)
 
-	logger.V(1).Info("Redis cluster rebalance command is", "Command", cmd)
-	executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-1")
+	logger.Info("Redis cluster rebalance command is", "Command", cmd)
+	return executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-1")
 }
 
 // Add redis cluster node would add a node to the existing redis cluster using redis-cli
@@ -262,7 +347,7 @@ func AddRedisNodeToCluster(cr *redisv1beta2.RedisCluster) {
 
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.ObjectMeta.Name+"-leader-0")...)
 
-	logger.V(1).Info("Redis cluster add-node command is", "Command", cmd)
+	logger.Info("Redis cluster add-node command is", "Command", cmd)
 	executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-0")
 }
 
@@ -292,12 +377,12 @@ func getAttachedFollowerNodeIDs(cr *redisv1beta2.RedisCluster, masterNodeID stri
 
 	}
 
-	logger.V(1).Info("Slaves Nodes attached to", "node", masterNodeID, "are", slaveIDs)
+	logger.Info("Slaves Nodes attached to", "node", masterNodeID, "are", slaveIDs)
 	return slaveIDs
 }
 
 // Remove redis follower node would remove all follower nodes of last leader node using redis-cli
-func RemoveRedisFollowerNodesFromCluster(cr *redisv1beta2.RedisCluster) {
+func RemoveRedisFollowerNodesFromCluster(cr *redisv1beta2.RedisCluster) bool {
 	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
 	var cmd []string
 	currentRedisCount := CheckRedisNodeCount(cr, "leader")
@@ -334,12 +419,14 @@ func RemoveRedisFollowerNodesFromCluster(cr *redisv1beta2.RedisCluster) {
 	}
 
 	for _, followerNodeID := range followerNodeIDs {
-
 		cmd = append(cmd, followerNodeID)
-		logger.V(1).Info("Redis cluster follower remove command is", "Command", cmd)
-		executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-0")
+		logger.Info("Redis cluster follower remove command is", "Command", cmd)
+		if !executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-0") {
+			return false
+		}
 		cmd = cmd[:len(cmd)-1]
 	}
+	return true
 }
 
 // Remove redis cluster node would remove last node to the existing redis cluster using redis-cli
@@ -379,17 +466,22 @@ func RemoveRedisNodeFromCluster(cr *redisv1beta2.RedisCluster) {
 
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.ObjectMeta.Name+"-leader-0")...)
 
-	logger.V(1).Info("Redis cluster leader remove command is", "Command", cmd)
+	logger.Info("Redis cluster leader remove command is", "Command", cmd)
 	if getRedisClusterSlots(cr, removePodNodeID) != "0" {
-		logger.V(1).Info("Skipping execution remove leader not empty", "cmd", cmd)
+		logger.Info("Skipping execution remove leader not empty", "cmd", cmd)
 	}
 	executeCommand(cr, cmd, cr.ObjectMeta.Name+"-leader-0")
 }
 
 // verifyLeaderPod return true if the pod is leader/master
-func VerifyLeaderPod(cr *redisv1beta2.RedisCluster) bool {
+func VerifyLeaderPod(cr *redisv1beta2.RedisCluster, leadFlag bool) bool {
 	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
-	podName := cr.Name + "-leader-" + strconv.Itoa(int(CheckRedisNodeCount(cr, "leader"))-1)
+	podName := cr.Name + "-leader-"
+	if leadFlag {
+		podName += "0"
+	} else {
+		podName += strconv.Itoa(int(CheckRedisNodeCount(cr, "leader")) - 1)
+	}
 
 	redisClient := configureRedisClient(cr, podName)
 	defer redisClient.Close()
@@ -410,9 +502,14 @@ func VerifyLeaderPod(cr *redisv1beta2.RedisCluster) bool {
 	return false
 }
 
-func ClusterFailover(cr *redisv1beta2.RedisCluster) {
+func ClusterFailover(cr *redisv1beta2.RedisCluster, leadFlag bool) bool {
 	logger := generateRedisManagerLogger(cr.Namespace, cr.ObjectMeta.Name)
-	slavePodName := cr.Name + "-leader-" + strconv.Itoa(int(CheckRedisNodeCount(cr, "leader"))-1)
+	slavePodName := cr.Name + "-leader-"
+	if leadFlag {
+		slavePodName += "0"
+	} else {
+		slavePodName += strconv.Itoa(int(CheckRedisNodeCount(cr, "leader")) - 1)
+	}
 	// cmd = redis-cli cluster failover  -a <pass>
 
 	var cmd []string
@@ -421,13 +518,14 @@ func ClusterFailover(cr *redisv1beta2.RedisCluster) {
 		Namespace: cr.Namespace,
 	}
 
-	cmd = []string{"redis-cli", "cluster", "failover"}
+	cmd = []string{"redis-cli", "-h"}
 
 	if *cr.Spec.ClusterVersion == "v7" {
-		cmd = append(cmd, getRedisHostname(pod, cr, "leader")+":6379")
+		cmd = append(cmd, getRedisHostname(pod, cr, "leader"))
 	} else {
-		cmd = append(cmd, getRedisServerIP(pod)+":6379")
+		cmd = append(cmd, getRedisServerIP(pod))
 	}
+	cmd = append(cmd, "-p", "6379")
 
 	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
 		pass, err := getRedisPassword(cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
@@ -437,9 +535,11 @@ func ClusterFailover(cr *redisv1beta2.RedisCluster) {
 		cmd = append(cmd, "-a")
 		cmd = append(cmd, pass)
 	}
+	cmd = append(cmd, "cluster", "failover")
 
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, slavePodName)...)
+	logger.Info("ready for cluster failover", "command", cmd, "pod", slavePodName)
+	logger.Info("Redis cluster failover command is", "Command", cmd)
 
-	logger.V(1).Info("Redis cluster failover command is", "Command", cmd)
-	executeCommand(cr, cmd, slavePodName)
+	return executeCommand(cr, cmd, slavePodName)
 }
